@@ -46,6 +46,8 @@ namespace EFCore.BulkExtensions
         public Func<DbTransaction, DbTransaction> UnderlyingTransaction { get; set; }
 
         internal OperationType OperationType { get; set; }
+
+        public bool LeaveConnectionOpen { get; set; }
     }
 
     public class StatsInfo

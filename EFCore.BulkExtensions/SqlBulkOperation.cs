@@ -94,7 +94,7 @@ namespace EFCore.BulkExtensions
                 }
                 finally
                 {
-                    if (transaction == null)
+                    if (transaction == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
                     {
                         connection.Close();
                     }
@@ -125,7 +125,7 @@ namespace EFCore.BulkExtensions
                         transaction.Commit();
                         transaction.Dispose();
                     }
-                    if (tableInfo.BulkConfig.SqliteConnection == null)
+                    if (tableInfo.BulkConfig.SqliteConnection == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
                         connection.Close();
                 }
             }
@@ -186,7 +186,7 @@ namespace EFCore.BulkExtensions
                 }
                 finally
                 {
-                    if (transaction == null)
+                    if (transaction == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
                     {
                         connection.Close();
                     }
@@ -217,7 +217,7 @@ namespace EFCore.BulkExtensions
                         transaction.Commit();
                         transaction.Dispose();
                     }
-                    if (tableInfo.BulkConfig.SqliteConnection == null)
+                    if (tableInfo.BulkConfig.SqliteConnection == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
                         connection.Close();
                 }
             }
@@ -278,7 +278,8 @@ namespace EFCore.BulkExtensions
                     if (keepIdentity && tableInfo.HasIdentity)
                     {
                         context.Database.ExecuteSqlRaw(SqlQueryBuilder.SetIdentityInsert(tableInfo.FullTableName, false));
-                        context.Database.CloseConnection();
+                        if (!tableInfo.BulkConfig.LeaveConnectionOpen)
+                            context.Database.CloseConnection();
                     }
                 }
             }
@@ -334,7 +335,7 @@ namespace EFCore.BulkExtensions
                         transaction.Commit();
                         transaction.Dispose();
                     }
-                    if (tableInfo.BulkConfig.SqliteConnection == null)
+                    if (tableInfo.BulkConfig.SqliteConnection == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
                         connection.Close();
                 }
             }
@@ -395,7 +396,8 @@ namespace EFCore.BulkExtensions
                     if (keepIdentity && tableInfo.HasIdentity)
                     {
                         await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.SetIdentityInsert(tableInfo.FullTableName, false), cancellationToken).ConfigureAwait(false);
-                        context.Database.CloseConnection();
+                        if (!tableInfo.BulkConfig.LeaveConnectionOpen)
+                            context.Database.CloseConnection();
                     }
                 }
             }
@@ -438,7 +440,7 @@ namespace EFCore.BulkExtensions
                         transaction.Commit();
                         transaction.Dispose();
                     }
-                    if (tableInfo.BulkConfig.SqliteConnection == null)
+                    if (tableInfo.BulkConfig.SqliteConnection == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
                         connection.Close();
                 }
             }

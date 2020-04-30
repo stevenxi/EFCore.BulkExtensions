@@ -288,7 +288,7 @@ namespace EFCore.BulkExtensions
             }
             finally
             {
-                if (currentTransaction == null)
+                if (currentTransaction == null && !BulkConfig.LeaveConnectionOpen)
                     sqlConnection.Close();
             }
         }
@@ -323,7 +323,7 @@ namespace EFCore.BulkExtensions
             }
             finally
             {
-                if (currentTransaction == null)
+                if (currentTransaction == null && !BulkConfig.LeaveConnectionOpen)
                 {
                     sqlConnection.Close();
                 }
@@ -361,7 +361,7 @@ namespace EFCore.BulkExtensions
             }
             finally
             {
-                if (currentTransaction == null)
+                if (currentTransaction == null && !BulkConfig.LeaveConnectionOpen)
                     sqlConnection.Close();
             }
             return tableExist;
@@ -398,7 +398,7 @@ namespace EFCore.BulkExtensions
             }
             finally
             {
-                if (currentTransaction == null)
+                if (currentTransaction == null && !BulkConfig.LeaveConnectionOpen)
                     sqlConnection.Close();
             }
             return tableExist;
