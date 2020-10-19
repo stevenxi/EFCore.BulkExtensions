@@ -22,9 +22,9 @@ namespace EFCore.BulkExtensions
 
         public bool UseTempDB { get; set; }
 
-        public bool TrackingEntities { get; set; }
+        public bool UniqueTableNameTempDb { get; set; } = true;
 
-        public bool UseOnlyDataTable { get; set; }
+        public bool TrackingEntities { get; set; }
 
         public bool WithHoldlock { get; set; } = true;
 
@@ -38,9 +38,6 @@ namespace EFCore.BulkExtensions
         public List<string> UpdateByProperties { get; set; }
 
         public SqlBulkCopyOptions SqlBulkCopyOptions { get; set; }
-
-        public SqliteConnection SqliteConnection { get; set; }
-        public SqliteTransaction SqliteTransaction { get; set; }
 
         public Func<DbConnection, DbConnection> UnderlyingConnection { get; set; }
         public Func<DbTransaction, DbTransaction> UnderlyingTransaction { get; set; }

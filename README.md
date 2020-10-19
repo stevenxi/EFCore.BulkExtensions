@@ -1,5 +1,7 @@
 # EFCore.BulkExtensions
-EntityFrameworkCore extensions: Bulk operations (**Insert, Update, Delete, Read, Upsert, Sync**) and Batch (**Delete, Update**).<br>
+EntityFrameworkCore extensions: <br>
+-Bulk operations (**Insert, Update, Delete, Read, Upsert, Sync, Truncate**) and <br>
+-Batch ops (**Delete, Update**).<br>
 Library is Lightweight and very Efficient, having all mostly used CRUD operation.<br>
 Was selected in top 20 [EF Core Extensions](https://docs.microsoft.com/en-us/ef/core/extensions/) recommended by Microsoft.<br>
 Current version is using EF Core 3.1 and at the moment supports Microsoft SQL Server(2008+) and SQLite.<br>
@@ -37,7 +39,7 @@ context.BulkRead(entitiesList);                   context.BulkReadAsync(entities
 context.Truncate<Entity>();                       context.TruncateAsync<Entity>();
 ```
 **Batch** Extensions are made on *IQueryable* DbSet and can be used as in the following code segment.<br>
-They are done as pure sql and no check is done whether some are prior loaded in memory and are being Tracked.
+They are done as pure sql and no check is done whether some are prior loaded in memory and are being Tracked.<br>
 (*updateColumns* is optional parameter in which PropertyNames added explicitly when we need update to it's default value)
 ```C#
 // Delete
@@ -60,27 +62,14 @@ int affected = q.BatchUpdate(new Item { Description = "Updated" }, updateColumns
 If Windows Authentication is used then in ConnectionString there should be *Trusted_Connection=True;* because Sql credentials are required to stay in connection.<br>
 
 When used directly each of these operations are separate transactions and are automatically committed.<br>
-And if we need multiple operations in single procedure then explicit transaction should be used, for example:
+And if we need multiple operations in single procedure then explicit transaction should be used.<br>
+For example since child tables are not automatically inserted with parent we need explicit second call:
 ```C#
 using (var transaction = context.Database.BeginTransaction())
 {
     context.BulkInsert(entitiesList);
     context.BulkInsert(subEntitiesList);
     transaction.Commit();
-}
-```
-For **SQLite** there are additional properties in BulkConfig: *{ SqliteConnection, SqliteTransaction }* that for explicit transaction are used in the following way:
-```C#
-using (var connection = (SqliteConnection)context.Database.GetDbConnection())
-{
-    connection.Open();
-    using (var transaction = connection.BeginTransaction())
-    {
-        var bulkConfig = new BulkConfig() { SqliteConnection = connection, SqliteTransaction = transaction };
-        context.BulkInsert(entities, bulkConfig);
-        context.BulkInsert(subEntities, bulkConfig);
-        transaction.Commit();
-    }
 }
 ```
 
@@ -96,15 +85,15 @@ More info in the [Example](https://github.com/borisdj/EFCore.BulkExtensions#read
 ## BulkConfig arguments
 
 **BulkInsert_/OrUpdate/OrDelete** methods can have optional argument **BulkConfig** with properties (bool, int, object, List<string>):<br>
-*{ PreserveInsertOrder, SetOutputIdentity, BatchSize, NotifyAfter, BulkCopyTimeout, EnableStreaming, UseTempDB, TrackingEntities, UseOnlyDataTable, WithHoldlock, CalculateStats, StatsInfo, PropertiesToInclude, PropertiesToExclude, UpdateByProperties, SqlBulkCopyOptions }*<br>
-Default behaviour is {<br>
-*PreserveInsertOrder*: false, *SetOutputIdentity*: false, *BatchSize*: 2000, *NotifyAfter*: null, *BulkCopyTimeout*: null,<br> *EnableStreaming*: false, *UseTempDB*: false, *TrackingEntities*: false, *UseOnlyDataTable*: false, *WithHoldlock*: true,<br> *CalculateStats*: false, *StatsInfo*: null, *PropertiesToInclude*: null, *PropertiesToExclude*: null, *UpdateByProperties*: null, *SqlBulkCopyOptions*: Default }<br>
-  and if we want to change it, BulkConfig should be added explicitly with one or more bool properties set to true, and/or int props like **BatchSize** to different number. Config also has DelegateFunc for setting *Underlying-Connection/Transaction*, e.g. in UnderlyingTest.<br>
-When doing update we can chose to exclude one or more properties by adding their names into **PropertiesToExclude**, or if we need to update less then half column then **PropertiesToInclude** can be used. Setting both Lists are not allowed.<br>
+{ *PreserveInsertOrder, SetOutputIdentity, BatchSize, NotifyAfter, BulkCopyTimeout, EnableStreaming, UseTempDB, TrackingEntities, WithHoldlock, CalculateStats, StatsInfo, PropertiesToInclude, PropertiesToExclude, UpdateByProperties, SqlBulkCopyOptions }*<br>
+Default behaviour is <br>
+{ *PreserveInsertOrder*: false, *SetOutputIdentity*: false, *BatchSize*: 2000, *NotifyAfter*: null, *BulkCopyTimeout*: null,<br> *EnableStreaming*: false, *UseTempDB*: false, *TrackingEntities*: false, *WithHoldlock*: true,<br> *CalculateStats*: false, *StatsInfo*: null, *PropertiesToInclude*: null, *PropertiesToExclude*: null, *UpdateByProperties*: null, *SqlBulkCopyOptions*: Default }<br><br>
+If we want to change defaults, BulkConfig should be added explicitly with one or more bool properties set to true, and/or int props like **BatchSize** to different number.<br> Config also has DelegateFunc for setting *Underlying-Connection/Transaction*, e.g. in UnderlyingTest.<br>
+When doing update we can chose to exclude one or more properties by adding their names into **PropertiesToExclude**, or if we need to update less then half column then **PropertiesToInclude** can be used. Setting both Lists are not allowed.<br><br>
 Additionaly there is **UpdateByProperties** for specifying custom properties, by which we want update to be done.<br>
 Using UpdateByProperties while also having Identity column requires that Id property be [Excluded](https://github.com/borisdj/EFCore.BulkExtensions/issues/131).<br>
-If **NotifyAfter** is not set it will have same value as _BatchSize_ while **BulkCopyTimeout** when not set has SqlBulkCopy default which is 30 seconds and if set to 0 it indicates no limit.<br>
-_PreserveInsertOrder_ and _SetOutputIdentity_ have purpose only when PK has Identity (usually *int* type with AutoIncrement), while if PK is Guid(sequential) created in Application there is no need for them. Also Tables with Composite Keys have no Identity column so no functionality for them in that case either.
+If **NotifyAfter** is not set it will have same value as _BatchSize_ while **BulkCopyTimeout** when not set has SqlBulkCopy default which is 30 seconds and if set to 0 it indicates no limit.<br><br>
+_PreserveInsertOrder_ and _SetOutputIdentity_ have purpose only when PK has Identity (usually *int* type with AutoIncrement), while if PK is Guid(sequential) created in Application there is no need for them.<br> Also Tables with Composite Keys have no Identity column so no functionality for them in that case either.
 ```C#
 var bulkConfig = new BulkConfig {PreserveInsertOrder = true, SetOutputIdentity = true, BatchSize = 4000 };
 context.BulkInsert(entList, bulkConfig);
@@ -163,8 +152,7 @@ using (var transaction = context.Database.BeginTransaction())
 When **CalculateStats** is set to True the result is return in `BulkConfig.StatsInfo` (*StatsNumber-Inserted/Updated*).<br>
 If used for pure Insert (with Batching) then SetOutputIdentity should also be configured because Merge have to be used.<br>
 **TrackingEntities** can be set to True if we want to have tracking of entities from BulkRead or when SetOutputIdentity is set.<br>
-**UseTempDB** when set then BulkOperation has to be [inside Transaction](https://github.com/borisdj/EFCore.BulkExtensions/issues/49).<br>
-**UseOnlyDataTable** when set DataTable is used [instead of FastMember](https://github.com/borisdj/EFCore.BulkExtensions/issues/320) library.
+**UseTempDB** when set then BulkOperation has to be [inside Transaction](https://github.com/borisdj/EFCore.BulkExtensions/issues/49)
 
 **SqlBulkCopyOptions** is Enum with [[Flags]](https://stackoverflow.com/questions/8447/what-does-the-flags-enum-attribute-mean-in-c) attribute which enables specifying one or more options:<br>
 *Default, KeepIdentity, CheckConstraints, TableLock, KeepNulls, FireTriggers, UseInternalTransaction*
@@ -178,7 +166,6 @@ Library supports [Global Query Filters](https://docs.microsoft.com/en-us/ef/core
 It also maps [OwnedTypes](https://docs.microsoft.com/en-us/ef/core/modeling/owned-entities), which is implemented with `DataTable` class.</br>
 With [Computed](https://docs.microsoft.com/en-us/ef/core/modeling/relational/computed-columns) and [Timestamp](https://docs.microsoft.com/en-us/ef/core/modeling/concurrency) Columns it will work in a way that they are automatically excluded from Insert. And when combined with *SetOutputIdentity* they will be Selected.<br>
 Bulk Extension methods can be [Overridden](https://github.com/borisdj/EFCore.BulkExtensions/issues/56) if required, for example to set AuditInfo.<br>
-For mapping FKs explicit Id properties have to be in entity. Having only [Navigation](https://github.com/borisdj/EFCore.BulkExtensions/issues/95) property is not supported.<br>
 If having problems with Deadlock there is useful info in [issue/46](https://github.com/borisdj/EFCore.BulkExtensions/issues/46).
 
 ## TPH inheritance
@@ -186,7 +173,7 @@ If having problems with Deadlock there is useful info in [issue/46](https://gith
 When having TPH ([Table-Per-Hierarchy](https://docs.microsoft.com/en-us/aspnet/core/data/ef-mvc/inheritance)) inheritance model it can be set in 2 ways.<br>
 First is automatically by Convention in which case Discriminator column is not directly in Entity but is [Shadow](http://www.learnentityframeworkcore.com/model/shadow-properties) Property.<br>
 And second is to explicitly define Discriminator property in Entity and configure it with `.HasDiscriminator()`.<br>
-Important remark regarding the first case is that since we can not set directly Discriminator to certain value we need first to add list of entities to DbSet where it will be set and after that we can call Bulk operation. Note that SaveChanges are not called and we could optionally turn of TrackingChanges for performance. Example:
+Important remark regarding the first case is that since we can not set directly Discriminator to certain value we need first to add list of entities to DbSet where it will be set and after that we can call Bulk operation. Note that SaveChanges are not called and we could optionally turn off TrackingChanges for performance. Example:
 ```C#
 public class Student : Person { ... }
 context.Students.AddRange(entities); // adding to Context so that Shadow property 'Discriminator' gets set
@@ -197,14 +184,15 @@ context.BulkInsert(entities);
 
 When we need to Select from big List of some Unique Prop./Column use BulkRead (JOIN done in Sql) for Efficiency:<br>
 ```C#
-// instead of 
+// instead of WhereIN which will TimeOut for List of several thousand
 var entities = context.Items.Where(a => itemsNames.Contains(a.Name)).AsNoTracking().ToList(); //SQL IN operator
 // or JOIN in Memory that loads entire table
 var entities = context.Items.Join(itemsNames, a => a.Name, p => p, (a, p) => a).AsNoTracking().ToList();
-// use
-var items = itemsNames.Select(a => new Item { Name = a }); // items list will be loaded with data
-var bulkConfig = new BulkConfig { UpdateByProperties = new List<string> { nameof(Item.Name) };
-context.Items.BulkRead(items, bulkConfig);
+
+// USE
+var items = itemsNames.Select(a => new Item { Name = a }); // creating list of Items where only Name is set
+var bulkConfig = new BulkConfig { UpdateByProperties = new List<string> { nameof(Item.Name) } };
+context.BulkRead(items, bulkConfig); // Items list will be loaded from Db with data(other properties)
 ```
 
 ## Performances
@@ -223,4 +211,4 @@ TestTable has 6 columns (Guid, string, string, int, decimal?, DateTime).<br>
 All were inserted and 2 of them (string, DateTime) were updated.<br>
 Test was done locally on following configuration: INTEL Core i5-3570K 3.40GHz, DDRIII 8GB x 2, SSD 840 EVO 128 GB.<br>
 For small data sets there is an overhead since most Bulk ops need to create Temp table and also Drop it after finish.
-Probably good advice would be to use Bulk ops for sets greater then 1000.
+Probably good advice would be to use Bulk ops for sets greater than 1000.

@@ -1,9 +1,9 @@
-using FastMember;
 using Microsoft.Data.SqlClient;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
@@ -18,7 +18,7 @@ namespace EFCore.BulkExtensions
     {
         SqlServer,
         MySql,
-        PostrgeSql,
+        PostgreSql,
         Sqlite,
     }
 
@@ -45,38 +45,33 @@ namespace EFCore.BulkExtensions
         #region MainOps
         public static void Insert<T>(DbContext context, IList<T> entities, TableInfo tableInfo, Action<decimal> progress)
         {
+            Insert<T>(context, typeof(T), entities, tableInfo, progress);
+        }
+
+        public static void Insert(DbContext context, Type type, IList<object> entities, TableInfo tableInfo, Action<decimal> progress)
+        {
+            Insert<object>(context, type, entities, tableInfo, progress);
+        }
+
+        private static void Insert<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, Action<decimal> progress)
+        {
             string providerName = context.Database.ProviderName; // "Microsoft.EntityFrameworkCore.*****"
             // -- SQL Server --
             if (providerName.EndsWith(DbServer.SqlServer.ToString()))
             {
                 var connection = OpenAndGetSqlConnection(context, tableInfo.BulkConfig);
-                var transaction = context.Database.CurrentTransaction;
                 try
                 {
+                    var transaction = context.Database.CurrentTransaction;
+
                     using (var sqlBulkCopy = GetSqlBulkCopy((SqlConnection)connection, transaction, tableInfo.BulkConfig))
                     {
-                        bool useFastMember = tableInfo.HasOwnedTypes == false                      // With OwnedTypes DataTable is used since library FastMember can not (https://github.com/mgravell/fast-member/issues/21)
-                                             && tableInfo.ColumnNameContainsSquareBracket == false // FastMember does not support escaped columnNames  ] -> ]]
-                                             && tableInfo.ShadowProperties.Count == 0              // With Shadow prop. Discriminator (TPH inheritance) also not used because FastMember is slow for Update (https://github.com/borisdj/EFCore.BulkExtensions/pull/17)
-                                             && !tableInfo.ConvertibleProperties.Any()             // With ConvertibleProperties FastMember is slow as well
-                                             && !tableInfo.HasAbstractList                         // AbstractList not working with FastMember
-                                             && !tableInfo.BulkConfig.UseOnlyDataTable;
-                        bool setColumnMapping = useFastMember;
+                        bool setColumnMapping = false;
                         tableInfo.SetSqlBulkCopyConfig(sqlBulkCopy, entities, setColumnMapping, progress);
                         try
                         {
-                            if (useFastMember)
-                            {
-                                using (var reader = ObjectReaderEx.Create(entities, tableInfo.ShadowProperties, tableInfo.ConvertibleProperties, context, tableInfo.PropertyColumnNamesDict.Keys.ToArray()))
-                                {
-                                    sqlBulkCopy.WriteToServer(reader);
-                                }
-                            }
-                            else
-                            {
-                                var dataTable = GetDataTable<T>(context, entities, sqlBulkCopy, tableInfo);
-                                sqlBulkCopy.WriteToServer(dataTable);
-                            }
+                            var dataTable = GetDataTable(context, type, entities, sqlBulkCopy, tableInfo);
+                            sqlBulkCopy.WriteToServer(dataTable);
                         }
                         catch (InvalidOperationException ex)
                         {
@@ -85,7 +80,7 @@ namespace EFCore.BulkExtensions
                                 if (!tableInfo.CheckTableExist(context, tableInfo))
                                 {
                                     context.Database.ExecuteSqlRaw(SqlQueryBuilder.CreateTableCopy(tableInfo.FullTableName, tableInfo.FullTempTableName, tableInfo)); // Will throw Exception specify missing db column: Invalid column name ''
-                                    context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName));
+                                    context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB));
                                 }
                             }
                             throw ex;
@@ -94,39 +89,46 @@ namespace EFCore.BulkExtensions
                 }
                 finally
                 {
-                    if (transaction == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
-                    {
-                        connection.Close();
-                    }
+                    if (!tableInfo.BulkConfig.LeaveConnectionOpen)
+                        context.Database.CloseConnection();
                 }
             }
             // -- SQLite --
             else if (providerName.EndsWith(DbServer.Sqlite.ToString()))
             {
                 var connection = OpenAndGetSqliteConnection(context, tableInfo.BulkConfig);
-                var transaction = tableInfo.BulkConfig.SqliteTransaction ?? connection.BeginTransaction();
+                bool doExplicitCommit = false;
+
                 try
                 {
-                    var command = GetSqliteCommand(context, entities, tableInfo, connection, transaction);
+                    if (context.Database.CurrentTransaction == null)
+                    {
+                        //context.Database.UseTransaction(connection.BeginTransaction());
+                        doExplicitCommit = true;
+                    }
+                    var transaction = (SqliteTransaction)(context.Database.CurrentTransaction == null ?
+                                                          connection.BeginTransaction() :
+                                                          context.Database.CurrentTransaction.GetUnderlyingTransaction(tableInfo.BulkConfig));
 
-                    var typeAccessor = TypeAccessor.Create(typeof(T), true);
+                    var command = GetSqliteCommand(context, type, entities, tableInfo, connection, transaction);
+
+                    type = tableInfo.HasAbstractList ? entities[0].GetType() : type;
                     int rowsCopied = 0;
                     foreach (var item in entities)
                     {
-                        LoadSqliteValues(tableInfo, typeAccessor, item, command);
+                        LoadSqliteValues(tableInfo, item, command);
                         command.ExecuteNonQuery();
                         SetProgress(ref rowsCopied, entities.Count, tableInfo.BulkConfig, progress);
+                    }
+                    if (doExplicitCommit)
+                    {
+                        transaction.Commit();
                     }
                 }
                 finally
                 {
-                    if (tableInfo.BulkConfig.SqliteTransaction == null)
-                    {
-                        transaction.Commit();
-                        transaction.Dispose();
-                    }
-                    if (tableInfo.BulkConfig.SqliteConnection == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
-                        connection.Close();
+                    if(!tableInfo.BulkConfig.LeaveConnectionOpen)
+                        context.Database.CloseConnection();
                 }
             }
             else
@@ -137,38 +139,33 @@ namespace EFCore.BulkExtensions
 
         public static async Task InsertAsync<T>(DbContext context, IList<T> entities, TableInfo tableInfo, Action<decimal> progress, CancellationToken cancellationToken)
         {
+            await InsertAsync<T>(context, typeof(T), entities, tableInfo, progress, cancellationToken).ConfigureAwait(false);
+        }
+
+        public static async Task InsertAsync(DbContext context, Type type, IList<object> entities, TableInfo tableInfo, Action<decimal> progress, CancellationToken cancellationToken)
+        {
+            await InsertAsync<object>(context, type, entities, tableInfo, progress, cancellationToken).ConfigureAwait(false);
+        }
+
+        private static async Task InsertAsync<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, Action<decimal> progress, CancellationToken cancellationToken)
+        {
             string providerName = context.Database.ProviderName; // "Microsoft.EntityFrameworkCore.*****"
             // -- SQL Server --
             if (providerName.EndsWith(DbServer.SqlServer.ToString()))
             {
                 var connection = await OpenAndGetSqlConnectionAsync(context, tableInfo.BulkConfig, cancellationToken).ConfigureAwait(false);
-                var transaction = context.Database.CurrentTransaction;
                 try
                 {
+                    var transaction = context.Database.CurrentTransaction;
+
                     using (var sqlBulkCopy = GetSqlBulkCopy((SqlConnection)connection, transaction, tableInfo.BulkConfig))
                     {
-                        bool useFastMember = tableInfo.HasOwnedTypes == false
-                                             && tableInfo.ColumnNameContainsSquareBracket == false
-                                             && tableInfo.ShadowProperties.Count == 0
-                                             && !tableInfo.ConvertibleProperties.Any()
-                                             && !tableInfo.HasAbstractList
-                                             && !tableInfo.BulkConfig.UseOnlyDataTable;
-                        bool setColumnMapping = useFastMember;
+                        bool setColumnMapping = false;
                         tableInfo.SetSqlBulkCopyConfig(sqlBulkCopy, entities, setColumnMapping, progress);
                         try
                         {
-                            if (useFastMember)
-                            {
-                                using (var reader = ObjectReaderEx.Create(entities, tableInfo.ShadowProperties, tableInfo.ConvertibleProperties, context, tableInfo.PropertyColumnNamesDict.Keys.ToArray()))
-                                {
-                                    await sqlBulkCopy.WriteToServerAsync(reader, cancellationToken).ConfigureAwait(false);
-                                }
-                            }
-                            else
-                            {
-                                var dataTable = GetDataTable<T>(context, entities, sqlBulkCopy, tableInfo);
-                                await sqlBulkCopy.WriteToServerAsync(dataTable, cancellationToken).ConfigureAwait(false);
-                            }
+                            var dataTable = GetDataTable(context, type, entities, sqlBulkCopy, tableInfo);
+                            await sqlBulkCopy.WriteToServerAsync(dataTable, cancellationToken).ConfigureAwait(false);
                         }
                         catch (InvalidOperationException ex)
                         {
@@ -177,7 +174,7 @@ namespace EFCore.BulkExtensions
                                 if (!await tableInfo.CheckTableExistAsync(context, tableInfo, cancellationToken).ConfigureAwait(false))
                                 {
                                     await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.CreateTableCopy(tableInfo.FullTableName, tableInfo.FullTempTableName, tableInfo), cancellationToken).ConfigureAwait(false);
-                                    await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName), cancellationToken).ConfigureAwait(false);
+                                    await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB), cancellationToken).ConfigureAwait(false);
                                 }
                             }
                             throw ex;
@@ -186,39 +183,47 @@ namespace EFCore.BulkExtensions
                 }
                 finally
                 {
-                    if (transaction == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
-                    {
-                        connection.Close();
-                    }
+                    if (!tableInfo.BulkConfig.LeaveConnectionOpen)
+                        await context.Database.CloseConnectionAsync().ConfigureAwait(false);
                 }
             }
             // -- SQLite --
             else if (providerName.EndsWith(DbServer.Sqlite.ToString()))
             {
                 var connection = await OpenAndGetSqliteConnectionAsync(context, tableInfo.BulkConfig, cancellationToken).ConfigureAwait(false);
-                var transaction = tableInfo.BulkConfig.SqliteTransaction ?? connection.BeginTransaction();
+                bool doExplicitCommit = false;
+
                 try
                 {
-                    var command = GetSqliteCommand(context, entities, tableInfo, connection, transaction);
+                    if (context.Database.CurrentTransaction == null)
+                    {
+                        //context.Database.UseTransaction(connection.BeginTransaction());
+                        doExplicitCommit = true;
+                    }
+                    var transaction = (SqliteTransaction)(context.Database.CurrentTransaction == null ?
+                                                          connection.BeginTransaction() :
+                                                          context.Database.CurrentTransaction.GetUnderlyingTransaction(tableInfo.BulkConfig));
 
-                    var typeAccessor = TypeAccessor.Create(typeof(T), true);
+                    var command = GetSqliteCommand(context, type, entities, tableInfo, connection, transaction);
+
+                    type = tableInfo.HasAbstractList ? entities[0].GetType() : type;
                     int rowsCopied = 0;
+
                     foreach (var item in entities)
                     {
-                        LoadSqliteValues(tableInfo, typeAccessor, item, command);
+                        LoadSqliteValues(tableInfo, item, command);
                         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                         SetProgress(ref rowsCopied, entities.Count, tableInfo.BulkConfig, progress);
+                    }
+                    if (doExplicitCommit)
+                    {
+                        transaction.Commit();
                     }
                 }
                 finally
                 {
-                    if (tableInfo.BulkConfig.SqliteTransaction == null)
-                    {
-                        transaction.Commit();
-                        transaction.Dispose();
-                    }
-                    if (tableInfo.BulkConfig.SqliteConnection == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
-                        connection.Close();
+                    if (!tableInfo.BulkConfig.LeaveConnectionOpen)
+                        await context.Database.CloseConnectionAsync().ConfigureAwait(false);
                 }
             }
             else
@@ -229,12 +234,28 @@ namespace EFCore.BulkExtensions
 
         public static void Merge<T>(DbContext context, IList<T> entities, TableInfo tableInfo, OperationType operationType, Action<decimal> progress) where T : class
         {
+            Merge<T>(context, typeof(T), entities, tableInfo, operationType, progress);
+        }
+
+        public static void Merge(DbContext context, Type type, IList<object> entities, TableInfo tableInfo, OperationType operationType, Action<decimal> progress)
+        {
+            Merge<object>(context, type, entities, tableInfo, operationType, progress);
+        }
+
+        private static void Merge<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, OperationType operationType, Action<decimal> progress) where T : class
+        {
             string providerName = context.Database.ProviderName;
             // -- SQL Server --
             if (providerName.EndsWith(DbServer.SqlServer.ToString()))
             {
                 tableInfo.InsertToTempTable = true;
-                tableInfo.CheckHasIdentity(context);
+
+                var dropTempTableIfExists = tableInfo.BulkConfig.UseTempDB;
+
+                if (dropTempTableIfExists)
+                {
+                    context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB));
+                }
 
                 context.Database.ExecuteSqlRaw(SqlQueryBuilder.CreateTableCopy(tableInfo.FullTableName, tableInfo.FullTempTableName, tableInfo));
                 if (tableInfo.CreatedOutputTable)
@@ -249,7 +270,7 @@ namespace EFCore.BulkExtensions
                 bool keepIdentity = tableInfo.BulkConfig.SqlBulkCopyOptions.HasFlag(SqlBulkCopyOptions.KeepIdentity);
                 try
                 {
-                    Insert(context, entities, tableInfo, progress);
+                    Insert(context, type, entities, tableInfo, progress);
 
                     if (keepIdentity && tableInfo.HasIdentity)
                     {
@@ -261,7 +282,7 @@ namespace EFCore.BulkExtensions
 
                     if (tableInfo.CreatedOutputTable)
                     {
-                        tableInfo.LoadOutputData(context, entities);
+                        tableInfo.LoadOutputData(context, type, entities);
                     }
                 }
                 finally
@@ -270,9 +291,9 @@ namespace EFCore.BulkExtensions
                     {
                         if (tableInfo.CreatedOutputTable)
                         {
-                            context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempOutputTableName));
+                            context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempOutputTableName, tableInfo.BulkConfig.UseTempDB));
                         }
-                        context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName));
+                        context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB));
                     }
 
                     if (keepIdentity && tableInfo.HasIdentity)
@@ -287,16 +308,26 @@ namespace EFCore.BulkExtensions
             else if (providerName.EndsWith(DbServer.Sqlite.ToString()))
             {
                 var connection = OpenAndGetSqliteConnection(context, tableInfo.BulkConfig);
-                var transaction = tableInfo.BulkConfig.SqliteTransaction ?? connection.BeginTransaction();
+                bool doExplicitCommit = false;
+
                 try
                 {
-                    var command = GetSqliteCommand(context, entities, tableInfo, connection, transaction);
+                    if (context.Database.CurrentTransaction == null)
+                    {
+                        //context.Database.UseTransaction(connection.BeginTransaction());
+                        doExplicitCommit = true;
+                    }
+                    var transaction = (SqliteTransaction)(context.Database.CurrentTransaction == null ?
+                                                          connection.BeginTransaction() :
+                                                          context.Database.CurrentTransaction.GetUnderlyingTransaction(tableInfo.BulkConfig));
 
-                    var typeAccessor = TypeAccessor.Create(typeof(T), true);
+                    var command = GetSqliteCommand(context, type, entities, tableInfo, connection, transaction);
+
+                    type = tableInfo.HasAbstractList ? entities[0].GetType() : type;
                     int rowsCopied = 0;
                     foreach (var item in entities)
                     {
-                        LoadSqliteValues(tableInfo, typeAccessor, item, command);
+                        LoadSqliteValues(tableInfo, item, command);
                         command.ExecuteNonQuery();
                         SetProgress(ref rowsCopied, entities.Count, tableInfo.BulkConfig, progress);
                     }
@@ -306,37 +337,35 @@ namespace EFCore.BulkExtensions
                         command.CommandText = SqlQueryBuilderSqlite.SelectLastInsertRowId();
                         long lastRowIdScalar = (long)command.ExecuteScalar();
                         var identityPropertyInteger = false;
-                        var accessor = TypeAccessor.Create(typeof(T), true);
-                        string identityPropertyName = tableInfo.PropertyColumnNamesDict.SingleOrDefault(a => a.Value == tableInfo.IdentityColumnName).Key;
-                        if (accessor.GetMembers().FirstOrDefault(x => x.Name == identityPropertyName)?.Type == typeof(int))
+                        string identityPropertyName = tableInfo.IdentityColumnName;
+
+                        if (tableInfo.FastPropertyDict[identityPropertyName].Property.PropertyType == typeof(int))
                         {
                             identityPropertyInteger = true;
                         }
-                        for (int i = entities.Count -1; i >= 0; i--)
+                        for (int i = entities.Count - 1; i >= 0; i--)
                         {
                             if (identityPropertyInteger)
                             {
-                                accessor[entities[i], identityPropertyName] = (int) lastRowIdScalar;
-
+                                tableInfo.FastPropertyDict[identityPropertyName].Set(entities[i], (int)lastRowIdScalar);
                             }
                             else
                             {
-                                accessor[entities[i], identityPropertyName] = lastRowIdScalar;
+                                tableInfo.FastPropertyDict[identityPropertyName].Set(entities[i], lastRowIdScalar);
                             }
 
                             lastRowIdScalar--;
                         }
                     }
+                    if (doExplicitCommit)
+                    {
+                        transaction.Commit();
+                    }
                 }
                 finally
                 {
-                    if (tableInfo.BulkConfig.SqliteTransaction == null)
-                    {
-                        transaction.Commit();
-                        transaction.Dispose();
-                    }
-                    if (tableInfo.BulkConfig.SqliteConnection == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
-                        connection.Close();
+                    if (!tableInfo.BulkConfig.LeaveConnectionOpen)
+                        context.Database.CloseConnection();
                 }
             }
             else
@@ -347,12 +376,28 @@ namespace EFCore.BulkExtensions
 
         public static async Task MergeAsync<T>(DbContext context, IList<T> entities, TableInfo tableInfo, OperationType operationType, Action<decimal> progress, CancellationToken cancellationToken) where T : class
         {
+            await MergeAsync<T>(context, typeof(T), entities, tableInfo, operationType, progress, cancellationToken).ConfigureAwait(false);
+        }
+
+        public static async Task MergeAsync(DbContext context, Type type, IList<object> entities, TableInfo tableInfo, OperationType operationType, Action<decimal> progress, CancellationToken cancellationToken)
+        {
+            await MergeAsync<object>(context, type, entities, tableInfo, operationType, progress, cancellationToken).ConfigureAwait(false);
+        }
+
+        private static async Task MergeAsync<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, OperationType operationType, Action<decimal> progress, CancellationToken cancellationToken) where T : class
+        {
             string providerName = context.Database.ProviderName;
             // -- SQL Server --
             if (providerName.EndsWith(DbServer.SqlServer.ToString()))
             {
                 tableInfo.InsertToTempTable = true;
-                await tableInfo.CheckHasIdentityAsync(context, cancellationToken).ConfigureAwait(false);
+
+                var dropTempTableIfExists = tableInfo.BulkConfig.UseTempDB;
+
+                if (dropTempTableIfExists)
+                {
+                    await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB)).ConfigureAwait(false);
+                }
 
                 await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.CreateTableCopy(tableInfo.FullTableName, tableInfo.FullTempTableName, tableInfo), cancellationToken).ConfigureAwait(false);
                 if (tableInfo.CreatedOutputTable)
@@ -367,7 +412,7 @@ namespace EFCore.BulkExtensions
                 bool keepIdentity = tableInfo.BulkConfig.SqlBulkCopyOptions.HasFlag(SqlBulkCopyOptions.KeepIdentity);
                 try
                 {
-                    await InsertAsync(context, entities, tableInfo, progress, cancellationToken).ConfigureAwait(false);
+                    await InsertAsync(context, type, entities, tableInfo, progress, cancellationToken).ConfigureAwait(false);
 
                     if (keepIdentity && tableInfo.HasIdentity)
                     {
@@ -379,7 +424,7 @@ namespace EFCore.BulkExtensions
 
                     if (tableInfo.CreatedOutputTable)
                     {
-                        await tableInfo.LoadOutputDataAsync(context, entities, cancellationToken).ConfigureAwait(false);
+                        await tableInfo.LoadOutputDataAsync(context, type, entities, cancellationToken).ConfigureAwait(false);
                     }
                 }
                 finally
@@ -388,9 +433,9 @@ namespace EFCore.BulkExtensions
                     {
                         if (tableInfo.CreatedOutputTable)
                         {
-                            await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempOutputTableName), cancellationToken).ConfigureAwait(false);
+                            await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempOutputTableName, tableInfo.BulkConfig.UseTempDB), cancellationToken).ConfigureAwait(false);
                         }
-                        await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName), cancellationToken).ConfigureAwait(false);
+                        await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB), cancellationToken).ConfigureAwait(false);
                     }
 
                     if (keepIdentity && tableInfo.HasIdentity)
@@ -405,16 +450,27 @@ namespace EFCore.BulkExtensions
             else if (providerName.EndsWith(DbServer.Sqlite.ToString()))
             {
                 var connection = await OpenAndGetSqliteConnectionAsync(context, tableInfo.BulkConfig, cancellationToken).ConfigureAwait(false);
-                var transaction = tableInfo.BulkConfig.SqliteTransaction ?? connection.BeginTransaction();
+                bool doExplicitCommit = false;
+
                 try
                 {
-                    var command = GetSqliteCommand(context, entities, tableInfo, connection, transaction);
+                    if (context.Database.CurrentTransaction == null)
+                    {
+                        //context.Database.UseTransaction(connection.BeginTransaction());
+                        doExplicitCommit = true;
+                    }
+                    var transaction = (SqliteTransaction)(context.Database.CurrentTransaction == null ?
+                                                          connection.BeginTransaction() :
+                                                          context.Database.CurrentTransaction.GetUnderlyingTransaction(tableInfo.BulkConfig));
 
-                    var typeAccessor = TypeAccessor.Create(typeof(T), true);
+                    var command = GetSqliteCommand(context, type, entities, tableInfo, connection, transaction);
+
+                    type = tableInfo.HasAbstractList ? entities[0].GetType() : type;
                     int rowsCopied = 0;
+
                     foreach (var item in entities)
                     {
-                        LoadSqliteValues(tableInfo, typeAccessor, item, command);
+                        LoadSqliteValues(tableInfo, item, command);
                         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                         SetProgress(ref rowsCopied, entities.Count, tableInfo.BulkConfig, progress);
                     }
@@ -422,26 +478,36 @@ namespace EFCore.BulkExtensions
                     if (operationType != OperationType.Delete && tableInfo.BulkConfig.SetOutputIdentity && tableInfo.IdentityColumnName != null)
                     {
                         command.CommandText = SqlQueryBuilderSqlite.SelectLastInsertRowId();
-                        long lastRowIdScalar = (long) await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-                        int lastRowId = (int)lastRowIdScalar;
-                        var accessor = TypeAccessor.Create(typeof(T), true);
+                        long lastRowIdScalar = (long)await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+                        var identityPropertyInteger = false;
                         string identityPropertyName = tableInfo.PropertyColumnNamesDict.SingleOrDefault(a => a.Value == tableInfo.IdentityColumnName).Key;
+                        if (tableInfo.FastPropertyDict[identityPropertyName].GetType() == typeof(int))
+                        {
+                            identityPropertyInteger = true;
+                        }
                         for (int i = entities.Count - 1; i >= 0; i--)
                         {
-                            accessor[entities[i], identityPropertyName] = lastRowId;
-                            lastRowId--;
+                            if (identityPropertyInteger)
+                            {
+                                tableInfo.FastPropertyDict[identityPropertyName].Set(entities[i], (int)lastRowIdScalar);
+                            }
+                            else
+                            {
+                                tableInfo.FastPropertyDict[identityPropertyName].Set(entities[i], lastRowIdScalar);
+                            }
+
+                            lastRowIdScalar--;
                         }
+                    }
+                    if (doExplicitCommit)
+                    {
+                        transaction.Commit();
                     }
                 }
                 finally
                 {
-                    if (tableInfo.BulkConfig.SqliteTransaction == null)
-                    {
-                        transaction.Commit();
-                        transaction.Dispose();
-                    }
-                    if (tableInfo.BulkConfig.SqliteConnection == null && !tableInfo.BulkConfig.LeaveConnectionOpen)
-                        connection.Close();
+                    if (!tableInfo.BulkConfig.LeaveConnectionOpen)
+                        await context.Database.CloseConnectionAsync().ConfigureAwait(false);
                 }
             }
             else
@@ -452,7 +518,24 @@ namespace EFCore.BulkExtensions
 
         public static void Read<T>(DbContext context, IList<T> entities, TableInfo tableInfo, Action<decimal> progress) where T : class
         {
+            Read<T>(context, typeof(T), entities, tableInfo, progress);
+        }
+
+        public static void Read(DbContext context, Type type, IList<object> entities, TableInfo tableInfo, Action<decimal> progress)
+        {
+            Read<object>(context, type, entities, tableInfo, progress);
+        }
+
+        private static void Read<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, Action<decimal> progress) where T : class
+        {
             Dictionary<string, string> previousPropertyColumnNamesDict = tableInfo.ConfigureBulkReadTableInfo(context);
+
+            var dropTempTableIfExists = tableInfo.BulkConfig.UseTempDB;
+
+            if (dropTempTableIfExists)
+            {
+                context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB));
+            }
 
             string providerName = context.Database.ProviderName;
             // -- SQL Server --
@@ -461,7 +544,7 @@ namespace EFCore.BulkExtensions
                 context.Database.ExecuteSqlRaw(SqlQueryBuilder.CreateTableCopy(tableInfo.FullTableName, tableInfo.FullTempTableName, tableInfo));
                 try
                 {
-                    Insert(context, entities, tableInfo, progress);
+                    Insert(context, type, entities, tableInfo, progress);
 
                     tableInfo.PropertyColumnNamesDict = tableInfo.OutputPropertyColumnNamesDict;
 
@@ -469,26 +552,95 @@ namespace EFCore.BulkExtensions
 
                     tableInfo.PropertyColumnNamesDict = previousPropertyColumnNamesDict;
 
-                    //var existingEntities = context.Set<T>().FromSql(q).AsNoTracking().ToList(); // Not used because of EF Memory leak bug
-                    Expression<Func<DbContext, IQueryable<T>>> expression = null;
-                    if (tableInfo.BulkConfig.TrackingEntities)
+                    List<T> existingEntities;
+                    if (typeof(T) == type)
                     {
-                        expression = (ctx) => ctx.Set<T>().FromSqlRaw(sqlQuery);
+                        Expression<Func<DbContext, IQueryable<T>>> expression = tableInfo.GetQueryExpression<T>(sqlQuery, false);
+                        var compiled = EF.CompileQuery(expression); // instead using Compiled queries
+                        existingEntities = compiled(context).ToList();
                     }
                     else
                     {
-                        expression = (ctx) => ctx.Set<T>().FromSqlRaw(sqlQuery).AsNoTracking();
+                        Expression<Func<DbContext, IEnumerable>> expression = tableInfo.GetQueryExpression(type, sqlQuery, false);
+                        var compiled = EF.CompileQuery(expression); // instead using Compiled queries
+                        existingEntities = compiled(context).Cast<T>().ToList();
                     }
 
-                    var compiled = EF.CompileQuery(expression); // instead using Compiled queries
-                    var existingEntities = compiled(context).ToList();
-
-                    tableInfo.UpdateReadEntities(entities, existingEntities);
+                    tableInfo.UpdateReadEntities(type, entities, existingEntities);
                 }
                 finally
                 {
                     if (!tableInfo.BulkConfig.UseTempDB)
-                        context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName));
+                        context.Database.ExecuteSqlRaw(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB));
+                }
+            }
+            // -- Sqlite --
+            else if (providerName.EndsWith(DbServer.Sqlite.ToString()))
+            {
+                throw new NotImplementedException();
+            }
+            else
+            {
+                throw new SqlProviderNotSupportedException(providerName);
+            }
+        }
+
+        public static async Task ReadAsync<T>(DbContext context, IList<T> entities, TableInfo tableInfo, Action<decimal> progress, CancellationToken cancellationToken) where T : class
+        {
+            await ReadAsync<T>(context, typeof(T), entities, tableInfo, progress, cancellationToken).ConfigureAwait(false);
+        }
+
+        public static async Task ReadAsync(DbContext context, Type type, IList<object> entities, TableInfo tableInfo, Action<decimal> progress, CancellationToken cancellationToken)
+        {
+            await ReadAsync<object>(context, type, entities, tableInfo, progress, cancellationToken).ConfigureAwait(false);
+        }
+
+        private static async Task ReadAsync<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, Action<decimal> progress, CancellationToken cancellationToken) where T : class
+        {
+            Dictionary<string, string> previousPropertyColumnNamesDict = tableInfo.ConfigureBulkReadTableInfo(context);
+
+            var dropTempTableIfExists = tableInfo.BulkConfig.UseTempDB;
+
+            if (dropTempTableIfExists)
+            {
+                await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB)).ConfigureAwait(false);
+            }
+
+            string providerName = context.Database.ProviderName;
+            // -- SQL Server --
+            if (providerName.EndsWith(DbServer.SqlServer.ToString()))
+            {
+                await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.CreateTableCopy(tableInfo.FullTableName, tableInfo.FullTempTableName, tableInfo), cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await InsertAsync(context, type, entities, tableInfo, progress, cancellationToken).ConfigureAwait(false);
+
+                    tableInfo.PropertyColumnNamesDict = tableInfo.OutputPropertyColumnNamesDict;
+
+                    var sqlQuery = SqlQueryBuilder.SelectJoinTable(tableInfo);
+
+                    tableInfo.PropertyColumnNamesDict = previousPropertyColumnNamesDict;
+
+                    List<T> existingEntities;
+                    if (typeof(T) == type)
+                    {
+                        Expression<Func<DbContext, IQueryable<T>>> expression = tableInfo.GetQueryExpression<T>(sqlQuery, false);
+                        var compiled = EF.CompileQuery(expression); // instead using Compiled queries
+                        existingEntities = compiled(context).ToList();
+                    }
+                    else
+                    {
+                        Expression<Func<DbContext, IEnumerable>> expression = tableInfo.GetQueryExpression(type, sqlQuery, false);
+                        var compiled = EF.CompileQuery(expression); // instead using Compiled queries
+                        existingEntities = compiled(context).Cast<T>().ToList();
+                    }
+
+                    tableInfo.UpdateReadEntities(type, entities, existingEntities);
+                }
+                finally
+                {
+                    if (!tableInfo.BulkConfig.UseTempDB)
+                        await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName, tableInfo.BulkConfig.UseTempDB), cancellationToken).ConfigureAwait(false);
                 }
             }
             // -- Sqlite --
@@ -515,59 +667,6 @@ namespace EFCore.BulkExtensions
             else if (providerName.EndsWith(DbServer.Sqlite.ToString()))
             {
                 context.Database.ExecuteSqlRaw(SqlQueryBuilder.DeleteTable(tableInfo.FullTableName));
-            }
-            else
-            {
-                throw new SqlProviderNotSupportedException(providerName);
-            }
-        }
-
-        public static async Task ReadAsync<T>(DbContext context, IList<T> entities, TableInfo tableInfo, Action<decimal> progress, CancellationToken cancellationToken) where T : class
-        {
-            Dictionary<string, string> previousPropertyColumnNamesDict = tableInfo.ConfigureBulkReadTableInfo(context);
-
-            string providerName = context.Database.ProviderName;
-            // -- SQL Server --
-            if (providerName.EndsWith(DbServer.SqlServer.ToString()))
-            {
-                await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.CreateTableCopy(tableInfo.FullTableName, tableInfo.FullTempTableName, tableInfo), cancellationToken).ConfigureAwait(false);
-                try
-                {
-                    await InsertAsync(context, entities, tableInfo, progress, cancellationToken).ConfigureAwait(false);
-
-                    tableInfo.PropertyColumnNamesDict = previousPropertyColumnNamesDict;
-
-                    var sqlQuery = SqlQueryBuilder.SelectJoinTable(tableInfo);
-
-                    tableInfo.PropertyColumnNamesDict = previousPropertyColumnNamesDict;
-
-                    //var existingEntities = await context.Set<T>().FromSql(sqlQuery).ToListAsync(cancellationToken);
-                    Expression<Func<DbContext, IQueryable<T>>> expression = null;
-                    if (tableInfo.BulkConfig.TrackingEntities)
-                    {
-                        expression = (ctx) => ctx.Set<T>().FromSqlRaw(sqlQuery);
-                    }
-                    else
-                    {
-                        expression = (ctx) => ctx.Set<T>().FromSqlRaw(sqlQuery).AsNoTracking();
-                    }
-                    //var compiled = EF.CompileAsyncQuery(expression);
-                    //var existingEntities = await compiled(context).ToListAsync(cancellationToken).ConfigureAwait(false); // TempFIX
-                    var compiled = EF.CompileQuery(expression); // instead using Compiled queries
-                    var existingEntities = compiled(context).ToList();
-
-                    tableInfo.UpdateReadEntities(entities, existingEntities);
-                }
-                finally
-                {
-                    if (!tableInfo.BulkConfig.UseTempDB)
-                        await context.Database.ExecuteSqlRawAsync(SqlQueryBuilder.DropTable(tableInfo.FullTempTableName), cancellationToken).ConfigureAwait(false);
-                }
-            }
-            // -- Sqlite --
-            else if (providerName.EndsWith(DbServer.Sqlite.ToString()))
-            {
-                throw new NotImplementedException();
             }
             else
             {
@@ -615,16 +714,17 @@ namespace EFCore.BulkExtensions
         #endregion
 
         #region DataTable
-        internal static DataTable GetDataTable<T>(DbContext context, IList<T> entities, SqlBulkCopy sqlBulkCopy, TableInfo tableInfo)
+        internal static DataTable GetDataTable<T>(DbContext context, Type type, IList<T> entities, SqlBulkCopy sqlBulkCopy, TableInfo tableInfo)
         {
             var dataTable = new DataTable();
             var columnsDict = new Dictionary<string, object>();
             var ownedEntitiesMappedProperties = new HashSet<string>();
 
-            var type = tableInfo.HasAbstractList ? entities[0].GetType() : typeof(T);
+            type = tableInfo.HasAbstractList ? entities[0].GetType() : type;
             var entityType = context.Model.FindEntityType(type);
             var entityPropertiesDict = entityType.GetProperties().Where(a => tableInfo.PropertyColumnNamesDict.ContainsKey(a.Name)).ToDictionary(a => a.Name, a => a);
             var entityNavigationOwnedDict = entityType.GetNavigations().Where(a => a.GetTargetType().IsOwned()).ToDictionary(a => a.Name, a => a);
+            var entityShadowFkPropertiesDict = entityType.GetProperties().Where(a => a.IsShadowProperty() && a.IsForeignKey()).ToDictionary(x => x.GetContainingForeignKeys().First().DependentToPrincipal.Name, a => a);
             var properties = type.GetProperties();
             var discriminatorColumn = tableInfo.ShadowProperties.Count == 0 ? null : tableInfo.ShadowProperties.ElementAt(0);
 
@@ -646,6 +746,24 @@ namespace EFCore.BulkExtensions
 
                     dataTable.Columns.Add(columnName, propertyType);
                     columnsDict.Add(property.Name, null);
+                }
+                else if (entityShadowFkPropertiesDict.ContainsKey(property.Name))
+                {
+                    var fk = entityShadowFkPropertiesDict[property.Name];
+                    entityPropertiesDict.TryGetValue(fk.GetColumnName(), out var entityProperty);
+                    if (entityProperty == null) // BulkRead
+                        continue;
+
+                    var columnName = entityProperty.GetColumnName();
+                    var propertyType = entityProperty.ClrType;
+                    var underlyingType = Nullable.GetUnderlyingType(propertyType);
+                    if (underlyingType != null)
+                    {
+                        propertyType = underlyingType;
+                    }
+
+                    dataTable.Columns.Add(columnName, propertyType);
+                    columnsDict.Add(columnName, null);
                 }
                 else if (entityNavigationOwnedDict.ContainsKey(property.Name)) // isOWned
                 {
@@ -679,9 +797,21 @@ namespace EFCore.BulkExtensions
                         {
                             if (ownedEntityPropertyNameColumnNameDict.ContainsKey(innerProperty.Name))
                             {
-                                string columnName = ownedEntityPropertyNameColumnNameDict[innerProperty.Name];
-                                var ownedPropertyType = Nullable.GetUnderlyingType(innerProperty.PropertyType) ?? innerProperty.PropertyType;
-                                dataTable.Columns.Add(columnName, ownedPropertyType);
+                                var columnName = ownedEntityPropertyNameColumnNameDict[innerProperty.Name];
+                                var propertyName = $"{property.Name}_{innerProperty.Name}";
+                                
+                                if (tableInfo.ConvertibleProperties.ContainsKey(propertyName))
+                                {
+                                    var convertor = tableInfo.ConvertibleProperties[propertyName];
+                                    var underlyingType = Nullable.GetUnderlyingType(convertor.ProviderClrType) ?? convertor.ProviderClrType;
+                                    dataTable.Columns.Add(columnName, underlyingType);
+                                }
+                                else
+                                {
+                                    var ownedPropertyType = Nullable.GetUnderlyingType(innerProperty.PropertyType) ?? innerProperty.PropertyType;
+                                    dataTable.Columns.Add(columnName, ownedPropertyType);
+                                }
+                                
                                 columnsDict.Add(property.Name + "_" + innerProperty.Name, null);
                             }
                         }
@@ -698,7 +828,7 @@ namespace EFCore.BulkExtensions
             {
                 foreach (var property in properties)
                 {
-                    var propertyValue = property.GetValue(entity, null);
+                    var propertyValue = tableInfo.FastPropertyDict.ContainsKey(property.Name) ? tableInfo.FastPropertyDict[property.Name].Get(entity) : null;
 
                     if (entityPropertiesDict.ContainsKey(property.Name))
                     {
@@ -713,12 +843,33 @@ namespace EFCore.BulkExtensions
                     {
                         columnsDict[property.Name] = propertyValue;
                     }
+                    else if (entityShadowFkPropertiesDict.ContainsKey(property.Name))
+                    {
+                        var fk = entityShadowFkPropertiesDict[property.Name];
+                        var columnName = fk.GetColumnName();
+                        entityPropertiesDict.TryGetValue(fk.GetColumnName(), out var entityProperty);
+                        if (entityProperty == null) // BulkRead
+                            continue;
+
+                        columnsDict[columnName] = propertyValue == null ? null : fk.FindFirstPrincipal().PropertyInfo.GetValue(propertyValue);
+                    }
                     else if (entityNavigationOwnedDict.ContainsKey(property.Name) && !tableInfo.LoadOnlyPKColumn)
                     {
                         var ownedProperties = property.PropertyType.GetProperties().Where(a => ownedEntitiesMappedProperties.Contains(property.Name + "_" + a.Name));
                         foreach (var ownedProperty in ownedProperties)
                         {
-                            columnsDict[property.Name + "_" + ownedProperty.Name] = propertyValue == null ? null : ownedProperty.GetValue(propertyValue, null);
+                            var columnName = $"{property.Name}_{ownedProperty.Name}";
+                            var ownedPropertyValue = tableInfo.FastPropertyDict[columnName].Get(propertyValue);
+
+                            if (tableInfo.ConvertibleProperties.ContainsKey(columnName))
+                            {
+                                var converter = tableInfo.ConvertibleProperties[columnName];
+                                columnsDict[columnName] = propertyValue == null ? null : converter.ConvertToProvider.Invoke(ownedPropertyValue);
+                            }
+                            else
+                            {
+                                columnsDict[columnName] = propertyValue == null ? null : ownedPropertyValue;
+                            }
                         }
                     }
                 }
@@ -735,7 +886,7 @@ namespace EFCore.BulkExtensions
         #endregion
 
         #region SqliteData
-        internal static SqliteCommand GetSqliteCommand<T>(DbContext context, IList<T> entities, TableInfo tableInfo, SqliteConnection connection, SqliteTransaction transaction)
+        internal static SqliteCommand GetSqliteCommand<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, SqliteConnection connection, SqliteTransaction transaction)
         {
             SqliteCommand command = connection.CreateCommand();
             command.Transaction = transaction;
@@ -753,9 +904,9 @@ namespace EFCore.BulkExtensions
             else if (operationType == OperationType.InsertOrUpdateDelete)
             {
                 throw new NotSupportedException("Sqlite supports only UPSERT(analog for MERGE WHEN MATCHED) but does not have functionality to do: 'WHEN NOT MATCHED BY SOURCE THEN DELETE'" +
-                                                "What can be done is to read all Data, find rows that are not is input List, then with those do the BulkDelete.");
+                                                "What can be done is to read all Data, find rows that are not in input List, then with those do the BulkDelete.");
             }
-            else if(operationType == OperationType.Update)
+            else if (operationType == OperationType.Update)
             {
                 command.CommandText = SqlQueryBuilderSqlite.UpdateSetTable(tableInfo);
             }
@@ -764,7 +915,7 @@ namespace EFCore.BulkExtensions
                 command.CommandText = SqlQueryBuilderSqlite.DeleteFromTable(tableInfo);
             }
 
-            var type = tableInfo.HasAbstractList ? entities[0].GetType() : typeof(T);
+            type = tableInfo.HasAbstractList ? entities[0].GetType() : type;
             var entityType = context.Model.FindEntityType(type);
             var entityPropertiesDict = entityType.GetProperties().Where(a => tableInfo.PropertyColumnNamesDict.ContainsKey(a.Name)).ToDictionary(a => a.Name, a => a);
             var properties = type.GetProperties();
@@ -801,34 +952,43 @@ namespace EFCore.BulkExtensions
             return command;
         }
 
-        internal static void LoadSqliteValues<T>(TableInfo tableInfo, TypeAccessor typeAccessor, T entity, SqliteCommand command)
+        internal static void LoadSqliteValues<T>(TableInfo tableInfo, T entity, SqliteCommand command)
         {
             var PropertyColumnsDict = tableInfo.PropertyColumnNamesDict;
             foreach (var propertyColumn in PropertyColumnsDict)
             {
-                object value = null;
+                object value;
                 if (!tableInfo.ShadowProperties.Contains(propertyColumn.Key))
                 {
                     if (propertyColumn.Key.Contains(".")) // ToDo: change IF clause to check for NavigationProperties, optimise, integrate with same code segment from LoadData method
                     {
-                        var subProperties = propertyColumn.Key.Split('.');
-                        var subPropertiesLevel1 = typeAccessor[entity, subProperties[0]];
+                        var ownedPropertyNameList = propertyColumn.Key.Split('.');
+                        var ownedPropertyName = ownedPropertyNameList[0];
+                        var subPropertyName = ownedPropertyNameList[1];
+                        var ownedFastProperty = tableInfo.FastPropertyDict[ownedPropertyName];
+                        var ownedProperty = ownedFastProperty.Property;
 
-                        var propertyType = Nullable.GetUnderlyingType(subPropertiesLevel1.GetType()) ?? subPropertiesLevel1.GetType();
+                        var propertyType = Nullable.GetUnderlyingType(ownedProperty.GetType()) ?? ownedProperty.GetType();
                         if (!command.Parameters.Contains("@" + propertyColumn.Value))
                         {
                             var parameter = new SqliteParameter($"@{propertyColumn.Value}", propertyType);
                             command.Parameters.Add(parameter);
                         }
 
-                        if (subPropertiesLevel1 == null)
-                            value = DBNull.Value;
+                        if (ownedProperty == null)
+                        {
+                            value = null;
+                        }
                         else
-                            value = subPropertiesLevel1.GetType().GetProperty(subProperties[1]).GetValue(subPropertiesLevel1) ?? DBNull.Value;
+                        {
+                            var ownedPropertyValue = tableInfo.FastPropertyDict[ownedPropertyName].Get(entity);
+                            var subPropertyFullName = $"{ownedPropertyName}_{subPropertyName}";
+                            value = tableInfo.FastPropertyDict[subPropertyFullName].Get(ownedPropertyValue);
+                        }
                     }
                     else
                     {
-                        value = typeAccessor[entity, propertyColumn.Key] ?? DBNull.Value;
+                        value = tableInfo.FastPropertyDict[propertyColumn.Key].Get(entity);
                     }
                 }
                 else // IsShadowProperty
@@ -836,12 +996,12 @@ namespace EFCore.BulkExtensions
                     value = entity.GetType().Name;
                 }
 
-                if (tableInfo.ConvertibleProperties.ContainsKey(propertyColumn.Key))
+                if (tableInfo.ConvertibleProperties.ContainsKey(propertyColumn.Key) && value != DBNull.Value)
                 {
                     value = tableInfo.ConvertibleProperties[propertyColumn.Key].ConvertToProvider.Invoke(value);
                 }
 
-                command.Parameters[$"@{propertyColumn.Value}"].Value = value;
+                command.Parameters[$"@{propertyColumn.Value}"].Value = value ?? DBNull.Value;
             }
         }
         #endregion
@@ -849,42 +1009,29 @@ namespace EFCore.BulkExtensions
         #region Connection
         internal static DbConnection OpenAndGetSqlConnection(DbContext context, BulkConfig config)
         {
-            var connection = context.GetUnderlyingConnection(config);
-            if (connection.State != ConnectionState.Open)
-            {
-                connection.Open();
-            }
-            return connection;
+            context.Database.OpenConnection();
+
+            return context.GetUnderlyingConnection(config);
         }
 
         internal static async Task<DbConnection> OpenAndGetSqlConnectionAsync(DbContext context, BulkConfig config, CancellationToken cancellationToken)
         {
-            var connection = context.GetUnderlyingConnection(config);
-            if (connection.State != ConnectionState.Open)
-            {
-                await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            }
-            return connection;
+            await context.Database.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+
+            return context.GetUnderlyingConnection(config);
         }
 
         internal static SqliteConnection OpenAndGetSqliteConnection(DbContext context, BulkConfig bulkConfig)
         {
-            var connection = bulkConfig.SqliteConnection ?? (SqliteConnection)context.Database.GetDbConnection();
-            if (connection.State != ConnectionState.Open)
-            {
-                connection.Open();
-            }
-            return connection;
+            context.Database.OpenConnection();
+
+            return (SqliteConnection)context.Database.GetDbConnection();
         }
 
         internal static async Task<SqliteConnection> OpenAndGetSqliteConnectionAsync(DbContext context, BulkConfig bulkConfig, CancellationToken cancellationToken)
         {
-            var connection = bulkConfig.SqliteConnection ?? (SqliteConnection)context.Database.GetDbConnection();
-            if (connection.State != ConnectionState.Open)
-            {
-                await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            }
-            return connection;
+            await context.Database.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            return (SqliteConnection)context.Database.GetDbConnection();
         }
 
         private static SqlBulkCopy GetSqlBulkCopy(SqlConnection sqlConnection, IDbContextTransaction transaction, BulkConfig config)

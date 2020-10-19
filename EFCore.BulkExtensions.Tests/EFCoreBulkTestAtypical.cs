@@ -225,7 +225,8 @@ namespace EFCore.BulkExtensions.Tests
                         Audit = new Audit
                         {
                             ChangedBy = "User" + 1,
-                            ChangedTime = DateTime.Now
+                            ChangedTime = DateTime.Now,
+                            InfoType = InfoType.InfoTypeA
                         }/*,
                         AuditExtended = new AuditExtended
                         {
@@ -254,6 +255,68 @@ namespace EFCore.BulkExtensions.Tests
                     );
                     Assert.Equal(2, entities[1].ChangeLogId);
                 }
+            }
+        }
+
+        [Theory]
+        [InlineData(DbServer.SqlServer)]
+        [InlineData(DbServer.Sqlite)]
+        private void InsertWithForeignKeyShadowProperties(DbServer databaseType)
+        {
+            ContextUtil.DbServer = databaseType;
+            using (var context = new TestContext(ContextUtil.GetOptions()))
+            {
+                if (databaseType == DbServer.SqlServer)
+                {
+                    context.Truncate<ItemLink>();
+                    context.Database.ExecuteSqlRaw("TRUNCATE TABLE [" + nameof(ItemLink) + "]");
+                }
+                else
+                {
+                    //context.ChangeLogs.BatchDelete(); // TODO
+                    context.BulkDelete(context.ItemLinks.ToList());
+                }
+                context.BulkDelete(context.Items.ToList()); // On table with FK Truncate does not work
+
+                for (int i = 1; i < 10; ++i)
+                {
+                    var entity = new Item
+                    {
+                        ItemId = 0,
+                        Name = "name " + i,
+                        Description = "info " + Guid.NewGuid().ToString().Substring(0, 3),
+                        Quantity = i % 10,
+                        Price = i / (i % 5 + 1),
+                        TimeUpdated = DateTime.Now,
+                        ItemHistories = new List<ItemHistory>()
+                    };
+
+                    context.Items.Add(entity);
+                }
+
+                context.SaveChanges();
+                var items = context.Items.ToList();
+                var entities = new List<ItemLink>();
+                for (int i = 0; i <= EntitiesNumber - 1; i++)
+                {
+                    entities.Add(new ItemLink
+                    {
+                        ItemLinkId = 0,
+                        Item = items[i % items.Count]
+                    });
+                }
+                context.BulkInsert(entities);
+
+                if (databaseType == DbServer.SqlServer)
+                {
+                    context.BulkRead(entities);
+                    foreach (var entity in entities)
+                    {
+                        Assert.NotNull(entity.Item);
+                    }
+                }
+
+                context.BulkDelete(context.ItemLinks.ToList());
             }
         }
     }

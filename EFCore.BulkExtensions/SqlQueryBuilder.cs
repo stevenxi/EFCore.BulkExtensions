@@ -42,13 +42,21 @@ namespace EFCore.BulkExtensions
             return q;
         }
 
-        public static string DropTable(string tableName)
+        public static string DropTable(string tableName, bool isTempTable)
         {
-            var q = $"IF OBJECT_ID('{tableName}', 'U') IS NOT NULL DROP TABLE {tableName}";
+            string q = null;
+            if (isTempTable)
+            {
+                q = $"IF OBJECT_ID ('tempdb..[#{tableName.Split('#')[1]}', 'U') IS NOT NULL DROP TABLE {tableName}";
+            }
+            else
+            {
+                q = $"IF OBJECT_ID ('{tableName}', 'U') IS NOT NULL DROP TABLE {tableName}";
+            }
             return q;
         }
 
-        public static string SelectIdentityColumnName(string tableName, string schemaName)
+        public static string SelectIdentityColumnName(string tableName, string schemaName) // No longer used
         {
             var q = $"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS " +
                     $"WHERE COLUMNPROPERTY(OBJECT_ID(TABLE_SCHEMA + '.' + TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1 " +

@@ -21,6 +21,7 @@ namespace EFCore.BulkExtensions.Tests
         public DbSet<Teacher> Teachers { get; set; }
         public DbSet<Info> Infos { get; set; }
         public DbSet<ChangeLog> ChangeLogs { get; set; }
+        public DbSet<ItemLink> ItemLinks { get; set; }
 
         public TestContext(DbContextOptions options) : base(options)
         {
@@ -35,6 +36,7 @@ namespace EFCore.BulkExtensions.Tests
 
             modelBuilder.Entity<Info>(e => { e.Property(p => p.ConvertedTime).HasConversion((value) => value.AddDays(1), (value) => value.AddDays(-1)); });
             modelBuilder.Entity<Info>().Property(e => e.InfoType).HasConversion(new EnumToStringConverter<InfoType>());
+            modelBuilder.Entity<ChangeLog>().OwnsOne(e => e.Audit, b => b.Property(e => e.InfoType).HasConversion(new EnumToStringConverter<InfoType>()));
 
             modelBuilder.Entity<Person>().HasIndex(a => a.Name).IsUnique(); // In SQLite UpdateByColumn(nonPK) requires it has UniqueIndex
 
@@ -188,9 +190,18 @@ namespace EFCore.BulkExtensions.Tests
 
         public string Message { get; set; }
 
+        public string Note { get; protected set; } // To test protected Setter
+
         public DateTime ConvertedTime { get; set; }
 
         public InfoType InfoType { get; set; }
+    }
+
+    // For testing ForeignKey Shadow Properties
+    public class ItemLink
+    {
+        public int ItemLinkId { get; set; }
+        public virtual Item Item { get; set; }
     }
 
     // For testing OwnedTypes
@@ -217,6 +228,8 @@ namespace EFCore.BulkExtensions.Tests
 
         [NotMapped] // alternatively in OnModelCreating(): modelBuilder.Entity<Audit>().Ignore(a => a.ChangedTime);
         public DateTime? ChangedTime { get; set; }
+        
+        public InfoType InfoType { get; set; }
     }
 
     [Owned]

@@ -29,14 +29,14 @@ namespace EFCore.BulkExtensions
         // DELETE [a]
         // FROM [Table] AS [a]
         // WHERE [a].[Columns] = FilterValues
-        public static (string, List<object>) GetSqlDelete<T>(IQueryable<T> query, DbContext context) where T : class
+        public static (string, List<object>) GetSqlDelete(IQueryable query, DbContext context)
         {
-            (string sql, string tableAlias, string tableAliasSufixAs, string topStatement, IEnumerable<object> innerParameters) = GetBatchSql(query, context, isUpdate: false);
+            (string sql, string tableAlias, string tableAliasSufixAs, string topStatement, string leadingComments, IEnumerable<object> innerParameters) = GetBatchSql(query, context, isUpdate: false);
 
             innerParameters = ReloadSqlParameters(context, innerParameters.ToList()); // Sqlite requires SqliteParameters
             tableAlias = (GetDatabaseType(context) == DbServer.SqlServer) ? $"[{tableAlias}]" : tableAlias;
 
-            var resultQuery = $"DELETE {topStatement}{tableAlias}{sql}";
+            var resultQuery = $"{leadingComments}DELETE {topStatement}{tableAlias}{sql}";
             return (resultQuery, new List<object>(innerParameters));
         }
 
@@ -47,16 +47,16 @@ namespace EFCore.BulkExtensions
         // UPDATE [a] SET [UpdateColumns] = N'updateValues'
         // FROM [Table] AS [a]
         // WHERE [a].[Columns] = FilterValues
-        public static (string, List<object>) GetSqlUpdate<T>(IQueryable<T> query, DbContext context, T updateValues, List<string> updateColumns) where T : class, new()
+        public static (string, List<object>) GetSqlUpdate(IQueryable query, DbContext context, object updateValues, List<string> updateColumns)
         {
-            (string sql, string tableAlias, string tableAliasSufixAs, string topStatement, IEnumerable<object> innerParameters) = GetBatchSql(query, context, isUpdate: true);
+            (string sql, string tableAlias, string tableAliasSufixAs, string topStatement, string leadingComments, IEnumerable<object> innerParameters) = GetBatchSql(query, context, isUpdate: true);
             var sqlParameters = new List<object>(innerParameters);
 
-            string sqlSET = GetSqlSetSegment(context, updateValues, updateColumns, sqlParameters);
+            string sqlSET = GetSqlSetSegment(context, updateValues.GetType(), updateValues, updateColumns, sqlParameters);
 
             sqlParameters = ReloadSqlParameters(context, sqlParameters); // Sqlite requires SqliteParameters
 
-            var resultQuery = $"UPDATE {topStatement}{tableAlias}{tableAliasSufixAs} {sqlSET}{sql}";
+            var resultQuery = $"{leadingComments}UPDATE {topStatement}{tableAlias}{tableAliasSufixAs} {sqlSET}{sql}";
             return (resultQuery, sqlParameters);
         }
 
@@ -69,17 +69,26 @@ namespace EFCore.BulkExtensions
         /// <returns></returns>
         public static (string, List<object>) GetSqlUpdate<T>(IQueryable<T> query, DbContext context, Expression<Func<T, T>> expression) where T : class
         {
-            (string sql, string tableAlias, string tableAliasSufixAs, string topStatement, IEnumerable<object> innerParameters) = GetBatchSql(query, context, isUpdate: true);
+            return GetSqlUpdate<T>(query, context, typeof(T), expression);
+        }
+        public static (string, List<object>) GetSqlUpdate(IQueryable query, DbContext context, Type type, Expression<Func<object, object>> expression)
+        {
+            return GetSqlUpdate<object>(query, context, type, expression);
+        }
+
+        private static (string, List<object>) GetSqlUpdate<T>(IQueryable query, DbContext context, Type type, Expression<Func<T, T>> expression) where T : class
+        {
+            (string sql, string tableAlias, string tableAliasSufixAs, string topStatement, string leadingComments, IEnumerable<object> innerParameters) = GetBatchSql(query, context, isUpdate: true);
             var sqlColumns = new StringBuilder();
             var sqlParameters = new List<object>(innerParameters);
-            var columnNameValueDict = TableInfo.CreateInstance(GetDbContext(query), new List<T>(), OperationType.Read, new BulkConfig()).PropertyColumnNamesDict;
+            var columnNameValueDict = TableInfo.CreateInstance(GetDbContext(query), type, new List<object>(), OperationType.Read, new BulkConfig()).PropertyColumnNamesDict;
             var dbType = GetDatabaseType(context);
             CreateUpdateBody(columnNameValueDict, tableAlias, expression.Body, dbType, ref sqlColumns, ref sqlParameters);
 
             sqlParameters = ReloadSqlParameters(context, sqlParameters); // Sqlite requires SqliteParameters
             sqlColumns = (GetDatabaseType(context) == DbServer.SqlServer) ? sqlColumns : sqlColumns.Replace($"[{tableAlias}].", "");
 
-            var resultQuery = $"UPDATE {topStatement}{tableAlias}{tableAliasSufixAs} SET {sqlColumns} {sql}";
+            var resultQuery = $"{leadingComments}UPDATE {topStatement}{tableAlias}{tableAliasSufixAs} SET {sqlColumns} {sql}";
             return (resultQuery, sqlParameters);
         }
 
@@ -102,11 +111,13 @@ namespace EFCore.BulkExtensions
             }
         }
 
-        public static (string, string, string, string, IEnumerable<object>) GetBatchSql<T>(IQueryable<T> query, DbContext context, bool isUpdate) where T : class
+        public static (string, string, string, string, string, IEnumerable<object>) GetBatchSql(IQueryable query, DbContext context, bool isUpdate)
         {
-            var (sqlQuery, innerParameters) = query.ToParametrizedSql();
+            var (fullSqlQuery, innerParameters) = query.ToParametrizedSql();
 
             DbServer databaseType = GetDatabaseType(context);
+            var (leadingComments, sqlQuery) = SplitLeadingCommentsAndMainSqlQuery(fullSqlQuery);
+
             string tableAlias = string.Empty;
             string tableAliasSufixAs = string.Empty;
             string topStatement = string.Empty;
@@ -133,15 +144,24 @@ namespace EFCore.BulkExtensions
                 sql = sql.Substring(match.Index + match.Length);
             }
 
-            return (sql, tableAlias, tableAliasSufixAs, topStatement, innerParameters);
+            return (sql, tableAlias, tableAliasSufixAs, topStatement, leadingComments, innerParameters);
         }
 
         public static string GetSqlSetSegment<T>(DbContext context, T updateValues, List<string> updateColumns, List<object> parameters) where T : class, new()
         {
             var tableInfo = TableInfo.CreateInstance<T>(context, new List<T>(), OperationType.Read, new BulkConfig());
+            return GetSqlSetSegment(context, tableInfo, typeof(T), updateValues, new T(), updateColumns, parameters);
+        }
+
+        public static string GetSqlSetSegment(DbContext context, Type updateValuesType, object updateValues, List<string> updateColumns, List<object> parameters)
+        {
+            var tableInfo = TableInfo.CreateInstance(context, updateValuesType, new List<object>(), OperationType.Read, new BulkConfig());
+            return GetSqlSetSegment(context, tableInfo, updateValuesType, updateValues, Activator.CreateInstance(updateValuesType), updateColumns, parameters);
+        }
+
+        private static string GetSqlSetSegment(DbContext context, TableInfo tableInfo, Type updateValuesType, object updateValues, object defaultValues, List<string> updateColumns, List<object> parameters)
+        {
             string sql = string.Empty;
-            Type updateValuesType = typeof(T);
-            var defaultValues = new T();
             foreach (var propertyNameColumnName in tableInfo.PropertyColumnNamesDict)
             {
                 string propertyName = propertyNameColumnName.Key;
@@ -299,7 +319,9 @@ namespace EFCore.BulkExtensions
             var stateManagerProperty = queryContextDependencies.GetProperty("StateManager", bindingFlags | BindingFlags.Public).GetValue(dependencies);
             var stateManager = (IStateManager)stateManagerProperty;
 
+#pragma warning disable EF1001 // Internal EF Core API usage.
             return stateManager.Context;
+#pragma warning restore EF1001 // Internal EF Core API usage.
         }
 
         public static DbServer GetDatabaseType(DbContext context)
@@ -320,6 +342,59 @@ namespace EFCore.BulkExtensions
                 return false;
             }
             return method.DeclaringType == typeof(string) && method.Name == nameof(string.Concat);
+        }
+
+        public static (string, string) SplitLeadingCommentsAndMainSqlQuery(string sqlQuery)
+        {
+            var leadingCommentsBuilder = new StringBuilder();
+            var mainSqlQuery = sqlQuery;
+            while (!string.IsNullOrWhiteSpace(mainSqlQuery) 
+                && !mainSqlQuery.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                if (mainSqlQuery.StartsWith("--"))
+                {
+                    // pull off line comment
+                    var indexOfNextNewLine = mainSqlQuery.IndexOf(Environment.NewLine);
+                    if (indexOfNextNewLine > -1)
+                    {
+                        leadingCommentsBuilder.Append(mainSqlQuery.Substring(0, indexOfNextNewLine + Environment.NewLine.Length));
+                        mainSqlQuery = mainSqlQuery.Substring(indexOfNextNewLine + Environment.NewLine.Length);
+                        continue;
+                    }
+                }
+
+                if (mainSqlQuery.StartsWith("/*"))
+                {
+                    var nextBlockCommentEndIndex = mainSqlQuery.IndexOf("*/");
+                    if (nextBlockCommentEndIndex > -1)
+                    {
+                        leadingCommentsBuilder.Append(mainSqlQuery.Substring(0, nextBlockCommentEndIndex + 2));
+                        mainSqlQuery = mainSqlQuery.Substring(nextBlockCommentEndIndex + 2);
+                        continue;
+                    }
+                }
+
+                var nextNonWhitespaceIndex = Array.FindIndex(mainSqlQuery.ToCharArray(), x => !char.IsWhiteSpace(x));
+
+                if (nextNonWhitespaceIndex > 0)
+                {
+                    leadingCommentsBuilder.Append(mainSqlQuery.Substring(0, nextNonWhitespaceIndex));
+                    mainSqlQuery = mainSqlQuery.Substring(nextNonWhitespaceIndex);
+                    continue;
+                }
+
+                // Fallback... just find the first index of SELECT
+                var selectIndex = mainSqlQuery.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+                if (selectIndex > 0)
+                {
+                    leadingCommentsBuilder.Append(mainSqlQuery.Substring(0, selectIndex));
+                    mainSqlQuery = mainSqlQuery.Substring(selectIndex);
+                }
+
+                break;
+            }
+
+            return (leadingCommentsBuilder.ToString(), mainSqlQuery);
         }
     }
 }
