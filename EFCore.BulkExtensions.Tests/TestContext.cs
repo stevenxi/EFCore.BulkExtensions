@@ -44,7 +44,7 @@ namespace EFCore.BulkExtensions.Tests
             {
                 modelBuilder.Entity<Document>().Property(p => p.ContentLength).HasComputedColumnSql($"(CONVERT([int], len([{nameof(Document.Content)}])))");
             }
-            else if (Database.IsSqlite())
+            else if(Database.IsSqlite())
             {
                 modelBuilder.Entity<Document>().Property(p => p.VersionChange).ValueGeneratedOnAddOrUpdate().IsConcurrencyToken().HasDefaultValueSql("CURRENT_TIMESTAMP");
             }

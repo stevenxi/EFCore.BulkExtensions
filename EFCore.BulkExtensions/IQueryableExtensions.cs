@@ -31,7 +31,7 @@ namespace EFCore.BulkExtensions
             if (relationalCommandCache != null)
             {
 #pragma warning disable EF1001 // Internal EF Core API usage.
-                var command = relationalCommandCache.GetRelationalCommand(parameterValues);
+                var command = relationalCommandCache.GetRelationalCommandTemplate(parameterValues);
 #pragma warning restore EF1001 // Internal EF Core API usage.
                 var parameterNames = new HashSet<string>(command.Parameters.Select(p => p.InvariantName));
                 sql = command.CommandText;

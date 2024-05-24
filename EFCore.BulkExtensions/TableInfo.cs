@@ -142,7 +142,7 @@ namespace EFCore.BulkExtensions
                 allProperties = extendedAllProperties.Distinct();
             }
 
-            var ownedTypes = entityType.GetNavigations().Where(a => a.GetTargetType().IsOwned());
+            var ownedTypes = entityType.GetNavigations().Where(a => a.TargetEntityType.IsOwned());
             HasOwnedTypes = ownedTypes.Any();
             OwnedTypesDict = ownedTypes.ToDictionary(a => a.Name, a => a);
 
@@ -222,7 +222,7 @@ namespace EFCore.BulkExtensions
                     ConvertibleProperties.Add(columnName, converter);
                 }
 
-                foreach (var navigation in entityType.GetNavigations().Where(x => !x.IsCollection() && !x.GetTargetType().IsOwned()))
+                foreach (var navigation in entityType.GetNavigations().Where(x => !x.IsCollection && !x.TargetEntityType.IsOwned()))
                 {
                     FastPropertyDict.Add(navigation.Name, new FastProperty(navigation.PropertyInfo));
                 }
@@ -236,10 +236,6 @@ namespace EFCore.BulkExtensions
 
                         Type navOwnedType = type.Assembly.GetType(property.PropertyType.FullName);
                         var ownedEntityType = context.Model.FindEntityType(property.PropertyType);
-                        if (ownedEntityType == null) // when entity has more then one ownedType (e.g. Address HomeAddress, Address WorkAddress) or one ownedType is in multiple Entities like Audit is usually.
-                        {
-                            ownedEntityType = context.Model.GetEntityTypes().SingleOrDefault(a => a.DefiningNavigationName == property.Name && a.DefiningEntityType.Name == entityType.Name);
-                        }
                         var ownedEntityProperties = ownedEntityType.GetProperties().ToList();
                         var ownedEntityPropertyNameColumnNameDict = new Dictionary<string, string>();
 
